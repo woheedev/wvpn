@@ -1,0 +1,21 @@
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Application data (if accidentally committed)
+*.crt
+*.key
+config.yml
+state.json
+
+# Windows resource file (auto-generated)
+rsrc.syso
+
+# Build artifacts
+*.exe
+*.exe~
+!binaries/*.exe
