@@ -57,7 +57,7 @@ func NewRelayServer(apiKey, relayIP string) *RelayServer {
 func generateInviteCode() string {
 	b := make([]byte, InviteCodeLength)
 	rand.Read(b)
-	
+
 	code := make([]byte, InviteCodeLength)
 	for i := 0; i < InviteCodeLength; i++ {
 		code[i] = InviteCodeChars[int(b[i])%len(InviteCodeChars)]
@@ -78,7 +78,7 @@ func (s *RelayServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	// Limit request body size to 1MB
 	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
-	
+
 	var req RegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
@@ -143,13 +143,13 @@ func (s *RelayServer) handleInvite(w http.ResponseWriter, r *http.Request) {
 
 	vars := mux.Vars(r)
 	inviteCode := strings.ToUpper(vars["code"])
-	
+
 	// Validate invite code format
 	if len(inviteCode) != InviteCodeLength {
 		http.Error(w, "Invalid invite code format", http.StatusBadRequest)
 		return
 	}
-	
+
 	// Check for valid characters only
 	for _, char := range inviteCode {
 		if !strings.ContainsRune(InviteCodeChars, char) {
@@ -199,7 +199,7 @@ func (s *RelayServer) handleUnregister(w http.ResponseWriter, r *http.Request) {
 
 	// Limit request body size to 1KB (unregister is small)
 	r.Body = http.MaxBytesReader(w, r.Body, 1024)
-	
+
 	var req UnregisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
@@ -248,13 +248,13 @@ func (s *RelayServer) cleanupExpired() {
 		s.mu.Lock()
 		now := time.Now()
 		expired := []string{}
-		
+
 		for code, network := range s.networks {
 			if now.After(network.ExpiresAt) {
 				expired = append(expired, code)
 			}
 		}
-		
+
 		for _, code := range expired {
 			delete(s.networks, code)
 			log.Printf("Expired network: %s", code)
@@ -268,7 +268,7 @@ var startTime = time.Now()
 func generateAPIKey() string {
 	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 	const length = 32
-	
+
 	key := make([]byte, length)
 	for i := 0; i < length; i++ {
 		// Use crypto/rand for unbiased selection
@@ -284,7 +284,7 @@ func getAPIKey(staticKey string) string {
 		log.Printf("Using provided API key")
 		return staticKey
 	}
-	
+
 	key := generateAPIKey()
 	log.Printf("Generated random API key")
 	return key
@@ -299,7 +299,7 @@ func generateSelfSignedCert() (*tls.Certificate, error) {
 
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{Organization: []string{"Nebula Relay"}},
+		Subject:      pkix.Name{Organization: []string{"Nebula Relay"}},
 		NotBefore:    time.Now(),
 		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
@@ -338,11 +338,11 @@ func getPublicIP() (string, error) {
 
 	for i, service := range services {
 		log.Printf("Trying IP detection service %d/%d: %s", i+1, len(services), service.url)
-		
+
 		client := &http.Client{
 			Timeout: service.timeout,
 		}
-		
+
 		resp, err := client.Get(service.url)
 		if err != nil {
 			log.Printf("Failed to get IP from %s: %v", service.url, err)
@@ -362,13 +362,13 @@ func getPublicIP() (string, error) {
 		}
 
 		ip := strings.TrimSpace(string(body))
-		
+
 		// Validate that we got a proper IP address
 		if net.ParseIP(ip) != nil {
 			log.Printf("Successfully detected public IP: %s (from %s)", ip, service.url)
 			return ip, nil
 		}
-		
+
 		log.Printf("Invalid IP response from %s: %s", service.url, ip)
 	}
 
@@ -381,7 +381,7 @@ func main() {
 	httpPort := flag.Int("port", RelayHTTPPort, "HTTPS API port")
 	apiKey := flag.String("key", "", "Static API key (optional, generates random if not provided)")
 	flag.Parse()
-	
+
 	var finalRelayIP string
 	if *relayIP == "" {
 		log.Printf("No IP provided, attempting to auto-detect public IP...")
@@ -395,10 +395,10 @@ func main() {
 		finalRelayIP = *relayIP
 		log.Printf("Using provided IP: %s", finalRelayIP)
 	}
-	
+
 	// Get or generate API key
 	finalAPIKey := getAPIKey(*apiKey)
-	
+
 	log.Printf("API Key: %s", finalAPIKey)
 	log.Printf("Share this key with hosts who need to register networks")
 
@@ -438,9 +438,8 @@ func main() {
 	log.Printf("Nebula lighthouse should be running on UDP %d", RelayUDPPort)
 	log.Printf("Public IP: %s", finalRelayIP)
 	log.Printf("⚠️  Using self-signed certificate - clients will need to accept certificate warning")
-	
+
 	if err := httpsServer.ListenAndServeTLS("", ""); err != nil {
 		log.Fatal(err)
 	}
 }
-
