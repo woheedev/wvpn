@@ -36,6 +36,9 @@ var nebulaBinary []byte
 //go:embed binaries/nebula-cert.exe
 var nebulaCertBinary []byte
 
+//go:embed icon.ico
+var iconBytes []byte
+
 var (
 	tempDir        string
 	wintunPath     string
@@ -198,6 +201,9 @@ func main() {
 
 	myApp := app.New()
 	myWindow := myApp.NewWindow("Wohee's VPN")
+	
+	iconResource := fyne.NewStaticResource("icon.ico", iconBytes)
+	myWindow.SetIcon(iconResource)
 
 	// Initialize application state with loaded settings
 	deviceName := getHostname()

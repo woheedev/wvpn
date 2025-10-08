@@ -31,10 +31,19 @@ if not exist wvpn.manifest (
     exit /b 1
 )
 
+REM Check if icon file exists
+if not exist icon.ico (
+    echo Warning: icon.ico not found! Building without icon.
+    set ICON_FLAG=
+) else (
+    echo Icon file found: icon.ico
+    set ICON_FLAG=-ico icon.ico
+)
+
 REM Check if rsrc.syso needs to be regenerated
 if not exist rsrc.syso (
-    echo Generating Windows resource file with manifest...
-    rsrc -manifest wvpn.manifest -o rsrc.syso
+    echo Generating Windows resource file with manifest and icon...
+    rsrc -manifest wvpn.manifest %ICON_FLAG% -o rsrc.syso
     if %ERRORLEVEL% NEQ 0 (
         echo Failed to generate resource file!
         pause
