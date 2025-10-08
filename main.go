@@ -348,8 +348,25 @@ func main() {
 	updateContent()
 	myWindow.SetFixedSize(true)
 	
-	// Cleanup Nebula when window closes
+	// Cleanup when window closes
 	myWindow.SetOnClosed(func() {
+		// Stop auto-regeneration if running
+		if state.stopAutoRegen != nil {
+			close(state.stopAutoRegen)
+			state.stopAutoRegen = nil
+		}
+		
+		// Unregister from relay server if hosting
+		if state.mode == "host" && state.inviteCode != "" {
+			unregisterFromRelay(state, state.inviteCode, addLog)
+		}
+		
+		// Stop control server
+		if state.controlServer != nil {
+			state.controlServer.Close()
+		}
+		
+		// Kill Nebula process
 		if state.nebulaProc != nil {
 			state.nebulaProc.Kill()
 		}
@@ -371,6 +388,31 @@ func sanitizeDeviceName(name string) string {
 		return -1
 	}, name)
 }
+
+func validateRelayServer(server string) error {
+	if server == "" {
+		return fmt.Errorf("relay server cannot be empty")
+	}
+	
+	// Check for basic format (hostname or IP)
+	if len(server) > 253 {
+		return fmt.Errorf("relay server address too long")
+	}
+	
+	// Check for dangerous characters that could be used for injection
+	if strings.ContainsAny(server, " \t\n\r\"'`$(){}[]|&;<>") {
+		return fmt.Errorf("relay server contains invalid characters")
+	}
+	
+	// Basic hostname/IP validation
+	if strings.HasPrefix(server, "http://") || strings.HasPrefix(server, "https://") {
+		return fmt.Errorf("relay server should not include protocol (http/https)")
+	}
+	
+	return nil
+}
+
+
 
 func newWhiteSeparator() *canvas.Rectangle {
 	line := canvas.NewRectangle(color.White)
@@ -575,6 +617,10 @@ func registerWithRelay(state *AppState, addLog func(string)) (string, error) {
 		return "", fmt.Errorf("relay server not configured - set in Settings")
 	}
 
+	if err := validateRelayServer(state.relayServer); err != nil {
+		return "", fmt.Errorf("invalid relay server: %w", err)
+	}
+
 	if state.relayAPIKey == "" {
 		return "", fmt.Errorf("API key required - set in Settings (host only)")
 	}
@@ -638,6 +684,10 @@ func registerWithRelay(state *AppState, addLog func(string)) (string, error) {
 // Fetch network info from relay (client)
 func fetchFromRelay(inviteCode string, relayServer string, relayPort int, addLog func(string)) (*InviteResponse, error) {
 	addLog("Fetching network info from relay...")
+
+	if err := validateRelayServer(relayServer); err != nil {
+		return nil, fmt.Errorf("invalid relay server: %w", err)
+	}
 
 	url := fmt.Sprintf("https://%s:%d/api/invite/%s", relayServer, relayPort, strings.ToUpper(inviteCode))
 	client := &http.Client{
@@ -916,6 +966,8 @@ func generateCA(addLog func(string)) error {
 		"-duration", "24h",
 		"-out-crt", caCertPath, 
 		"-out-key", caKeyPath)
+	// Clear environment to prevent injection
+	cmd.Env = []string{}
 	cmd.Dir = configDir
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: 0x08000000,
@@ -952,6 +1004,8 @@ func generateHostCert(deviceName string, addLog func(string)) error {
 		"-out-crt", hostCertPath,
 		"-out-key", hostKeyPath,
 	)
+	// Clear environment to prevent injection
+	cmd.Env = []string{}
 	cmd.Dir = configDir
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: 0x08000000,
@@ -1051,7 +1105,7 @@ logging:
   format: text
 `
 	
-	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
+	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 	
@@ -1085,7 +1139,7 @@ func generateClientCert(deviceName string, invite *InviteResponse, addLog func(s
 	caCertPath := filepath.Join(configDir, "ca.crt")
 	caKeyPath := filepath.Join(configDir, "ca.key")
 	
-	if err := os.WriteFile(caCertPath, caCertData, 0644); err != nil {
+	if err := os.WriteFile(caCertPath, caCertData, 0600); err != nil {
 		return "", fmt.Errorf("failed to write CA cert: %w", err)
 	}
 	
@@ -1104,6 +1158,8 @@ func generateClientCert(deviceName string, invite *InviteResponse, addLog func(s
 		"-out-crt", clientCertPath,
 		"-out-key", clientKeyPath,
 	)
+	// Clear environment to prevent injection
+	cmd.Env = []string{}
 	cmd.Dir = configDir
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: 0x08000000,
@@ -1184,7 +1240,7 @@ logging:
   format: text
 `, caCertPath, clientCertPath, clientKeyPath, invite.HostIP, invite.RelayIP, invite.HostIP)
 	
-	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
+	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 	
@@ -2137,7 +2193,10 @@ func openSettingsWindow(state *AppState, setStatus func(string), app fyne.App) {
 	go func() {
 		// Initial scan
 		time.Sleep(500 * time.Millisecond)
-		apps, _ := detectRunningApps()
+		apps, err := detectRunningApps()
+		if err != nil {
+			apps = []RunningApp{} // Use empty slice if detection fails
+		}
 		fyne.Do(func() {
 			if state.settingsWindow == nil {
 				return

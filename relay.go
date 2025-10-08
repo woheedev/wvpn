@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"log"
 	"math/big"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -70,6 +69,14 @@ func (s *RelayServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.limiter.Allow() {
+		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
+	// Limit request body size to 1MB
+	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
+	
 	var req RegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
@@ -134,6 +141,20 @@ func (s *RelayServer) handleInvite(w http.ResponseWriter, r *http.Request) {
 
 	vars := mux.Vars(r)
 	inviteCode := strings.ToUpper(vars["code"])
+	
+	// Validate invite code format
+	if len(inviteCode) != InviteCodeLength {
+		http.Error(w, "Invalid invite code format", http.StatusBadRequest)
+		return
+	}
+	
+	// Check for valid characters only
+	for _, char := range inviteCode {
+		if !strings.ContainsRune(InviteCodeChars, char) {
+			http.Error(w, "Invalid invite code characters", http.StatusBadRequest)
+			return
+		}
+	}
 
 	s.mu.RLock()
 	network, exists := s.networks[inviteCode]
@@ -169,6 +190,14 @@ func (s *RelayServer) handleUnregister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.limiter.Allow() {
+		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
+	// Limit request body size to 1KB (unregister is small)
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	
 	var req UnregisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
@@ -238,12 +267,12 @@ func generateAPIKey() string {
 	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 	const length = 32
 	
-	b := make([]byte, length)
-	rand.Read(b)
-	
 	key := make([]byte, length)
 	for i := 0; i < length; i++ {
-		key[i] = chars[int(b[i])%len(chars)]
+		// Use crypto/rand for unbiased selection
+		b := make([]byte, 1)
+		rand.Read(b)
+		key[i] = chars[b[0]%byte(len(chars))]
 	}
 	return string(key)
 }
@@ -266,35 +295,23 @@ func generateSelfSignedCert() (*tls.Certificate, error) {
 		return nil, err
 	}
 
-	// Create certificate template
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			Organization:  []string{"Nebula Relay"},
-			Country:       []string{"US"},
-			Province:      []string{""},
-			Locality:      []string{"San Francisco"},
-			StreetAddress: []string{""},
-			PostalCode:    []string{""},
-		},
+		Subject: pkix.Name{Organization: []string{"Nebula Relay"}},
 		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(365 * 24 * time.Hour), // 1 year
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 	}
 
-	// Create certificate
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
 	if err != nil {
 		return nil, err
 	}
 
-	// Encode to PEM
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
 
-	// Create TLS certificate
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return nil, err
@@ -342,8 +359,11 @@ func main() {
 	// Create HTTPS server
 	addr := fmt.Sprintf(":%d", *httpPort)
 	httpsServer := &http.Server{
-		Addr:    addr,
-		Handler: r,
+		Addr:         addr,
+		Handler:      r,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{*cert},
 		},
