@@ -1291,9 +1291,9 @@ firewall:
     # Note: Approved clients get dynamic firewall rules via host config updates
 
   inbound:
-    # Host can always reach client
-    - port: any
-      proto: any
+    # Only control server access initially
+    - port: 9999
+      proto: tcp
       host: "100.200.0.1"
 
 logging:
