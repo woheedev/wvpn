@@ -93,6 +93,36 @@ type ClientManager struct {
 // SETTINGS PERSISTENCE
 // ============================================================================
 
+func loadStartupConfig() (*Settings, error) {
+	exePath, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get executable path: %w", err)
+	}
+
+	exeDir := filepath.Dir(exePath)
+	configPath := filepath.Join(exeDir, "wvpn.json")
+
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return nil, nil
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read startup config: %w", err)
+	}
+
+	var config Settings
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("failed to parse startup config: %w", err)
+	}
+
+	if err := os.Remove(configPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Failed to delete startup config file: %v\n", err)
+	}
+
+	return &config, nil
+}
+
 func loadSettings() (*Settings, error) {
 	settingsPath := filepath.Join(baseDir, "settings.json")
 
@@ -133,6 +163,10 @@ func saveSettings(state *AppState) error {
 		settings.DeviceName = state.deviceName
 	}
 
+	return saveSettingsFromStruct(&settings)
+}
+
+func saveSettingsFromStruct(settings *Settings) error {
 	data, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal settings: %w", err)
@@ -189,12 +223,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Load saved settings
+	startupConfig, err := loadStartupConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Failed to load startup config: %v\n", err)
+	}
+
 	settings, err := loadSettings()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: Failed to load settings: %v\n", err)
 		settings = &Settings{
 			RelayPort: RelayHTTPPort,
+		}
+	}
+
+	if startupConfig != nil {
+		if startupConfig.RelayServer != "" {
+			settings.RelayServer = startupConfig.RelayServer
+		}
+		if startupConfig.RelayPort > 0 {
+			settings.RelayPort = startupConfig.RelayPort
+		}
+		if startupConfig.RelayAPIKey != "" {
+			settings.RelayAPIKey = startupConfig.RelayAPIKey
+		}
+		if err := saveSettingsFromStruct(settings); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to save merged settings: %v\n", err)
 		}
 	}
 
