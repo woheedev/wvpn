@@ -2402,16 +2402,12 @@ func openSettingsWindow(state *AppState, setStatus func(string), app fyne.App) {
 	}
 
 	relayTab := container.NewVBox(
-		widget.NewLabel("Relay Configuration (Required)"),
-		widget.NewLabel("All connections require a relay server"),
-		widget.NewLabel("✅ Using HTTPS with self-signed certificates"),
-		newWhiteSeparator(),
 		widget.NewForm(
 			widget.NewFormItem("Server Address", relayServerEntry),
 			widget.NewFormItem("HTTPS Port", relayPortEntry),
 			widget.NewFormItem("API Key*", relayAPIEntry),
 		),
-		widget.NewLabel("* Required for hosting"),
+		widget.NewLabel("* Only required for hosting"),
 	)
 
 	// Create tabs
