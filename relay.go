@@ -13,8 +13,10 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -320,15 +322,78 @@ func generateSelfSignedCert() (*tls.Certificate, error) {
 	return &tlsCert, nil
 }
 
+// getPublicIP attempts to detect the public IP address using multiple services
+func getPublicIP() (string, error) {
+	// List of reliable IP detection services in order of preference
+	services := []struct {
+		url     string
+		timeout time.Duration
+	}{
+		{"https://ifconfig.me/ip", 5 * time.Second},
+		{"https://checkip.amazonaws.com", 5 * time.Second},
+		{"https://api.ipify.org", 5 * time.Second},
+		{"https://ipv4.icanhazip.com", 5 * time.Second},
+		{"https://ipecho.net/plain", 5 * time.Second},
+	}
+
+	for i, service := range services {
+		log.Printf("Trying IP detection service %d/%d: %s", i+1, len(services), service.url)
+		
+		client := &http.Client{
+			Timeout: service.timeout,
+		}
+		
+		resp, err := client.Get(service.url)
+		if err != nil {
+			log.Printf("Failed to get IP from %s: %v", service.url, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("Service %s returned status %d", service.url, resp.StatusCode)
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("Failed to read response from %s: %v", service.url, err)
+			continue
+		}
+
+		ip := strings.TrimSpace(string(body))
+		
+		// Validate that we got a proper IP address
+		if net.ParseIP(ip) != nil {
+			log.Printf("Successfully detected public IP: %s (from %s)", ip, service.url)
+			return ip, nil
+		}
+		
+		log.Printf("Invalid IP response from %s: %s", service.url, ip)
+	}
+
+	return "", fmt.Errorf("failed to detect public IP from all %d services", len(services))
+}
+
 func main() {
 	// Parse command-line arguments
-	relayIP := flag.String("ip", "", "Public IP address of this relay server (required)")
+	relayIP := flag.String("ip", "", "Public IP address of this relay server (auto-detected if not provided)")
 	httpPort := flag.Int("port", RelayHTTPPort, "HTTPS API port")
 	apiKey := flag.String("key", "", "Static API key (optional, generates random if not provided)")
 	flag.Parse()
 	
+	var finalRelayIP string
 	if *relayIP == "" {
-		log.Fatal("Error: -ip flag is required (public IP address of this server)")
+		log.Printf("No IP provided, attempting to auto-detect public IP...")
+		detectedIP, err := getPublicIP()
+		if err != nil {
+			log.Fatalf("Failed to auto-detect public IP: %v\nPlease provide IP manually with -ip flag", err)
+		}
+		finalRelayIP = detectedIP
+		log.Printf("Auto-detected public IP: %s", finalRelayIP)
+	} else {
+		finalRelayIP = *relayIP
+		log.Printf("Using provided IP: %s", finalRelayIP)
 	}
 	
 	// Get or generate API key
@@ -344,7 +409,7 @@ func main() {
 	}
 
 	// Create server
-	server := NewRelayServer(finalAPIKey, *relayIP)
+	server := NewRelayServer(finalAPIKey, finalRelayIP)
 
 	// Start cleanup goroutine
 	go server.cleanupExpired()
@@ -371,7 +436,7 @@ func main() {
 
 	log.Printf("Relay server starting on %s (HTTPS)", addr)
 	log.Printf("Nebula lighthouse should be running on UDP %d", RelayUDPPort)
-	log.Printf("Public IP: %s", *relayIP)
+	log.Printf("Public IP: %s", finalRelayIP)
 	log.Printf("⚠️  Using self-signed certificate - clients will need to accept certificate warning")
 	
 	if err := httpsServer.ListenAndServeTLS("", ""); err != nil {
