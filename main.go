@@ -1,13 +1,16 @@
 package main
 
 import (
+	"crypto/tls"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"image/color"
+	"io"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,7 +27,6 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// Embed binaries at build time
 //go:embed binaries/wintun.dll
 var wintunDLL []byte
 
@@ -34,52 +36,111 @@ var nebulaBinary []byte
 //go:embed binaries/nebula-cert.exe
 var nebulaCertBinary []byte
 
-// Global paths to extracted binaries
 var (
 	tempDir        string
 	wintunPath     string
 	nebulaPath     string
 	nebulaCertPath string
-	configDir      string // Directory for Nebula config and certs (set based on mode)
-	baseDir        string // Base directory for the application
+	configDir      string
+	baseDir        string
 )
 
-// InviteCode structure for joining networks
-type InviteCode struct {
-	HostIP    string `json:"h"` // Host lighthouse IP (e.g., "127.0.0.1:4242" for local testing)
-	CACert    string `json:"c"` // Base64 encoded CA certificate
-	CAKey     string `json:"k"` // Base64 encoded CA key (INSECURE - for local testing only)
-	NetworkIP string `json:"n"` // Network range (e.g., "100.200.0.0/24")
-}
-
-// Service represents an exposed port/application
 type Service struct {
-	Name string // User-friendly name (e.g., "Minecraft Server")
-	Port int    // Port number (e.g., 25565)
-	Proto string // Protocol: "tcp" or "udp"
+	Name  string `json:"name"`
+	Port  int    `json:"port"`
+	Proto string `json:"proto"`
 }
 
-// Client represents a connected client
+type RunningApp struct {
+	ExeName  string
+	TCPPorts []int
+	UDPPorts []int
+	Selected bool
+}
+
+type Settings struct {
+	DeviceName  string    `json:"device_name,omitempty"`
+	Services    []Service `json:"services,omitempty"`
+	RelayServer string    `json:"relay_server,omitempty"`
+	RelayPort   int       `json:"relay_port,omitempty"`
+	RelayAPIKey string    `json:"relay_api_key,omitempty"`
+}
+
 type Client struct {
-	Name      string    // Device name
-	IP        string    // Nebula IP (e.g., "100.200.0.5")
-	Status    string    // "pending" or "approved"
-	ConnTime  time.Time // Connection time
-	Conn      net.Conn  // TCP connection for control messages
+	Name     string
+	IP       string
+	Status   string
+	ConnTime time.Time
+	Conn     net.Conn
 }
 
-// ControlMessage for host-client communication
 type ControlMessage struct {
 	Type string `json:"type"` // "register", "approve", "kick", "heartbeat"
 	Name string `json:"name,omitempty"`
 	IP   string `json:"ip,omitempty"`
 }
 
-// ClientManager handles client connections
 type ClientManager struct {
-	clients map[string]*Client // Key: client IP
+	clients map[string]*Client
 	mu      sync.RWMutex
 	addLog  func(string)
+}
+
+// ============================================================================
+// SETTINGS PERSISTENCE
+// ============================================================================
+
+func loadSettings() (*Settings, error) {
+	settingsPath := filepath.Join(baseDir, "settings.json")
+	
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &Settings{
+				RelayPort: RelayHTTPPort,
+			}, nil
+		}
+		return nil, fmt.Errorf("failed to read settings: %w", err)
+	}
+	
+	var settings Settings
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return nil, fmt.Errorf("failed to parse settings: %w", err)
+	}
+	
+	// Set default port if missing
+	if settings.RelayPort == 0 {
+		settings.RelayPort = RelayHTTPPort
+	}
+	
+	return &settings, nil
+}
+
+func saveSettings(state *AppState) error {
+	defaultHostname := getHostname()
+	
+	settings := Settings{
+		Services:    state.services,
+		RelayServer: state.relayServer,
+		RelayPort:   state.relayPort,
+		RelayAPIKey: state.relayAPIKey,
+	}
+	
+	if state.deviceName != defaultHostname {
+		settings.DeviceName = state.deviceName
+	}
+	
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal settings: %w", err)
+	}
+	
+	settingsPath := filepath.Join(baseDir, "settings.json")
+	if err := os.WriteFile(settingsPath, data, 0600); err != nil {
+		return fmt.Errorf("failed to write settings: %w", err)
+	}
+	
+	return nil
 }
 
 // ============================================================================
@@ -92,7 +153,7 @@ type AppState struct {
 	showClients    bool           // Clients window open state
 	editingDevice  bool           // Device name editing mode
 	deviceName     string         // Current device name (max 16 chars)
-	inviteCode     string         // Current invite code (base64 encoded JSON)
+	inviteCode     string         // Current invite code (6-char code from relay)
 	clientIP       string         // Assigned client IP (for join mode)
 	isConnected    bool           // True when Nebula is running (host or client)
 	isApproved     bool           // True when host approves client (client only)
@@ -104,6 +165,14 @@ type AppState struct {
 	settingsWindow fyne.Window    // Reference to settings popup window
 	nebulaProc     *os.Process    // Running Nebula process
 	kickedByHost   bool           // True if client was kicked by host
+	
+	// Relay configuration (mandatory)
+	relayServer string // Relay server address (IP or domain)
+	relayPort   int    // Relay HTTP API port
+	relayAPIKey string // API key for host registration
+	
+	// Auto-regeneration
+	stopAutoRegen chan bool // Signal to stop auto-regeneration
 }
 
 // ============================================================================
@@ -117,30 +186,52 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Cleanup temp directory on exit
-	defer cleanupTempDir()
+
+	// Load saved settings
+	settings, err := loadSettings()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Failed to load settings: %v\n", err)
+		settings = &Settings{
+			RelayPort: RelayHTTPPort,
+		}
+	}
 
 	myApp := app.New()
-	myWindow := myApp.NewWindow("Nebula VPN")
+	myWindow := myApp.NewWindow("Wohee's VPN")
 
-	// Initialize application state
+	// Initialize application state with loaded settings
+	deviceName := getHostname()
+	if settings.DeviceName != "" {
+		deviceName = settings.DeviceName
+	}
+
 	state := &AppState{
 		mode:           "",
 		showLogs:       false,
 		showClients:    false,
 		editingDevice:  false,
-		deviceName:     getHostname(),
-		inviteCode:     "", // Will be generated when host mode starts
-		clientIP:       "", // Will be assigned when joining
+		deviceName:     deviceName,
+		inviteCode:     "",
+		clientIP:       "",
 		isConnected:    false,
 		isApproved:     false,
-		services:       []Service{}, // Empty services list
-		clientManager:  nil, // Will be created in host mode
+		services:       settings.Services,
+		clientManager:  nil,
 		controlServer:  nil,
 		controlClient:  nil,
 		clientsWindow:  nil,
 		settingsWindow: nil,
 		kickedByHost:   false,
+		
+		relayServer: settings.RelayServer,
+		relayPort:   settings.RelayPort,
+		relayAPIKey: settings.RelayAPIKey,
+		
+		stopAutoRegen: nil,
+	}
+	
+	if state.services == nil {
+		state.services = []Service{}
 	}
 
 	// UI containers
@@ -150,6 +241,8 @@ func main() {
 	// Status label (italic styling for visual separation)
 	statusLabel := widget.NewLabel("Ready")
 	statusLabel.TextStyle = fyne.TextStyle{Italic: true}
+	statusLabel.Wrapping = fyne.TextTruncate
+	statusLabel.Truncation = fyne.TextTruncateEllipsis
 
 	// Logs display (disabled for read-only)
 	logsDisplay := widget.NewEntry()
@@ -209,7 +302,7 @@ func main() {
 
 		// Add logs height if shown
 		if state.showLogs {
-			height += 100
+			height += 73
 		}
 
 		myWindow.Resize(fyne.NewSize(300, height))
@@ -269,6 +362,16 @@ func main() {
 // HELPER FUNCTIONS
 // ============================================================================
 
+func sanitizeDeviceName(name string) string {
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || 
+		   (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return -1
+	}, name)
+}
+
 func newWhiteSeparator() *canvas.Rectangle {
 	line := canvas.NewRectangle(color.White)
 	line.SetMinSize(fyne.NewSize(0, 1))
@@ -286,52 +389,321 @@ func getHostname() string {
 	return name
 }
 
-// Generate invite code from CA certificate
-// Note: Includes CA private key for easy client cert generation.
-// Suitable for temporary gaming sessions (24h cert expiration).
-// New CA generated each time host starts, so old invite codes become invalid.
-func generateInviteCode() (string, error) {
+// ============================================================================
+// APPLICATION DETECTION
+// ============================================================================
+
+// Detect running applications with listening ports
+func detectRunningApps() ([]RunningApp, error) {
+	// Map PID to ports
+	type PortInfo struct {
+		Port  int
+		Proto string
+	}
+	pidToPorts := make(map[string][]PortInfo)
+	
+	// Detect TCP ports
+	cmd := exec.Command("netstat", "-ano", "-p", "TCP")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: 0x08000000,
+	}
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to run netstat TCP: %w", err)
+	}
+	
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if !strings.Contains(line, "LISTENING") {
+			continue
+		}
+		
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		
+		// Parse local address (e.g., "0.0.0.0:25565" or "[::]:25565")
+		localAddr := fields[1]
+		lastColon := strings.LastIndex(localAddr, ":")
+		if lastColon == -1 {
+			continue
+		}
+		
+		portStr := localAddr[lastColon+1:]
+		port, err := fmt.Sscanf(portStr, "%d", new(int))
+		if err != nil || port == 0 {
+			continue
+		}
+		var portNum int
+		fmt.Sscanf(portStr, "%d", &portNum)
+		
+		pid := fields[len(fields)-1]
+		pidToPorts[pid] = append(pidToPorts[pid], PortInfo{Port: portNum, Proto: "tcp"})
+	}
+	
+	// Detect UDP ports
+	cmd = exec.Command("netstat", "-ano", "-p", "UDP")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: 0x08000000,
+	}
+	output, err = cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to run netstat UDP: %w", err)
+	}
+	
+	lines = strings.Split(string(output), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		
+		// Parse local address
+		localAddr := fields[1]
+		lastColon := strings.LastIndex(localAddr, ":")
+		if lastColon == -1 {
+			continue
+		}
+		
+		portStr := localAddr[lastColon+1:]
+		var portNum int
+		if _, err := fmt.Sscanf(portStr, "%d", &portNum); err != nil || portNum == 0 {
+			continue
+		}
+		
+		pid := fields[len(fields)-1]
+		pidToPorts[pid] = append(pidToPorts[pid], PortInfo{Port: portNum, Proto: "udp"})
+	}
+	
+	// Map PID to exe name
+	cmd = exec.Command("tasklist", "/FO", "CSV", "/NH")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: 0x08000000,
+	}
+	output, err = cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to run tasklist: %w", err)
+	}
+	
+	pidToExe := make(map[string]string)
+	lines = strings.Split(string(output), "\n")
+	for _, line := range lines {
+		// CSV format: "imagename","PID","sessionname","session#","memusage"
+		fields := strings.Split(line, "\",\"")
+		if len(fields) < 2 {
+			continue
+		}
+		
+		exeName := strings.Trim(fields[0], "\"")
+		pidStr := strings.Trim(fields[1], "\"")
+		pidToExe[pidStr] = exeName
+	}
+	
+	// Group by exe name
+	exeToApps := make(map[string]*RunningApp)
+	for pid, ports := range pidToPorts {
+		exeName, exists := pidToExe[pid]
+		if !exists {
+			continue
+		}
+		
+		if _, exists := exeToApps[exeName]; !exists {
+			exeToApps[exeName] = &RunningApp{
+				ExeName:  exeName,
+				TCPPorts: []int{},
+				UDPPorts: []int{},
+			}
+		}
+		
+		for _, portInfo := range ports {
+			if portInfo.Proto == "tcp" {
+				// Check if port already exists
+				found := false
+				for _, p := range exeToApps[exeName].TCPPorts {
+					if p == portInfo.Port {
+						found = true
+						break
+					}
+				}
+				if !found {
+					exeToApps[exeName].TCPPorts = append(exeToApps[exeName].TCPPorts, portInfo.Port)
+				}
+			} else {
+				found := false
+				for _, p := range exeToApps[exeName].UDPPorts {
+					if p == portInfo.Port {
+						found = true
+						break
+					}
+				}
+				if !found {
+					exeToApps[exeName].UDPPorts = append(exeToApps[exeName].UDPPorts, portInfo.Port)
+				}
+			}
+		}
+	}
+	
+	// Convert to slice
+	apps := []RunningApp{}
+	for _, app := range exeToApps {
+		if len(app.TCPPorts) > 0 || len(app.UDPPorts) > 0 {
+			apps = append(apps, *app)
+		}
+	}
+	
+	return apps, nil
+}
+
+// Check if a service already exists (deduplication)
+func serviceExists(services []Service, port int, proto string) bool {
+	for _, s := range services {
+		if s.Port == port && s.Proto == proto {
+			return true
+		}
+	}
+	return false
+}
+
+// ============================================================================
+// RELAY API FUNCTIONS
+// ============================================================================
+
+// Register network with relay server (host only)
+func registerWithRelay(state *AppState, addLog func(string)) (string, error) {
+	if state.relayServer == "" {
+		return "", fmt.Errorf("relay server not configured - set in Settings")
+	}
+
+	if state.relayAPIKey == "" {
+		return "", fmt.Errorf("API key required - set in Settings (host only)")
+	}
+
+	addLog("Registering with relay server...")
+
+	// Read CA cert and key
 	caCertPath := filepath.Join(configDir, "ca.crt")
 	caKeyPath := filepath.Join(configDir, "ca.key")
-	
+
 	caCertData, err := os.ReadFile(caCertPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read CA cert: %w", err)
 	}
-	
+
 	caKeyData, err := os.ReadFile(caKeyPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read CA key: %w", err)
 	}
 
-	invite := InviteCode{
-		HostIP:    "127.0.0.1:4242", // For local testing, use localhost
-		CACert:    base64.StdEncoding.EncodeToString(caCertData),
-		CAKey:     base64.StdEncoding.EncodeToString(caKeyData),
-		NetworkIP: "100.200.0.0/24",
+	// Prepare request
+	req := RegisterRequest{
+		APIKey: state.relayAPIKey,
+		CACert: base64.StdEncoding.EncodeToString(caCertData),
+		CAKey:  base64.StdEncoding.EncodeToString(caKeyData),
 	}
 
-	jsonData, err := json.Marshal(invite)
+	reqBody, err := json.Marshal(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal invite: %w", err)
+		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	return base64.StdEncoding.EncodeToString(jsonData), nil
+	// Send request
+	url := fmt.Sprintf("https://%s:%d/api/register", state.relayServer, state.relayPort)
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	resp, err := client.Post(url, "application/json", strings.NewReader(string(reqBody)))
+	if err != nil {
+		return "", fmt.Errorf("failed to connect to relay: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("relay error %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse response
+	var regResp RegisterResponse
+	if err := json.NewDecoder(resp.Body).Decode(&regResp); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	addLog(fmt.Sprintf("Registered! Invite code: %s", regResp.InviteCode))
+	return regResp.InviteCode, nil
 }
 
-// Parse invite code
-func parseInviteCode(code string) (*InviteCode, error) {
-	jsonData, err := base64.StdEncoding.DecodeString(code)
+// Fetch network info from relay (client)
+func fetchFromRelay(inviteCode string, relayServer string, relayPort int, addLog func(string)) (*InviteResponse, error) {
+	addLog("Fetching network info from relay...")
+
+	url := fmt.Sprintf("https://%s:%d/api/invite/%s", relayServer, relayPort, strings.ToUpper(inviteCode))
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	resp, err := client.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("invalid invite code format: %w", err)
+		return nil, fmt.Errorf("failed to connect to relay: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("relay returned error %d: %s", resp.StatusCode, string(body))
 	}
 
-	var invite InviteCode
-	if err := json.Unmarshal(jsonData, &invite); err != nil {
-		return nil, fmt.Errorf("invalid invite code data: %w", err)
+	// Parse response
+	var inviteResp InviteResponse
+	if err := json.NewDecoder(resp.Body).Decode(&inviteResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	return &invite, nil
+	addLog("Network info retrieved from relay")
+	return &inviteResp, nil
+}
+
+// Unregister from relay (host cleanup)
+func unregisterFromRelay(state *AppState, inviteCode string, addLog func(string)) {
+	if state.relayServer == "" || inviteCode == "" {
+		return
+	}
+
+	req := UnregisterRequest{
+		APIKey:     state.relayAPIKey,
+		InviteCode: inviteCode,
+	}
+
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return
+	}
+
+	url := fmt.Sprintf("https://%s:%d/api/unregister", state.relayServer, state.relayPort)
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	httpReq, err := http.NewRequest(http.MethodDelete, url, strings.NewReader(string(reqBody)))
+	if err != nil {
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		addLog("Unregistered from relay server")
+	}
 }
 
 // ============================================================================
@@ -351,13 +723,21 @@ func (cm *ClientManager) AddClient(name, ip string, conn net.Conn) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	
-	// Check if client already exists (e.g., reconnecting after Nebula restart)
+	// Check if client already exists (reconnecting)
 	if existingClient, exists := cm.clients[ip]; exists {
-		// Update connection but preserve approval status
+		// Update connection and preserve approval status
 		existingClient.Conn = conn
 		existingClient.ConnTime = time.Now()
-		existingClient.Name = name // Update name in case it changed
-		cm.addLog(fmt.Sprintf("Client reconnected: %s (%s) - status: %s", name, ip, existingClient.Status))
+		existingClient.Name = name
+		
+		if existingClient.Status == "approved" {
+			cm.addLog(fmt.Sprintf("Approved client reconnected: %s (%s)", name, ip))
+			// Send approval message immediately
+			approveMsg := ControlMessage{Type: "approve"}
+			json.NewEncoder(conn).Encode(approveMsg)
+		} else {
+			cm.addLog(fmt.Sprintf("Pending client reconnected: %s (%s)", name, ip))
+		}
 		return
 	}
 	
@@ -369,7 +749,7 @@ func (cm *ClientManager) AddClient(name, ip string, conn net.Conn) {
 		ConnTime: time.Now(),
 		Conn:     conn,
 	}
-	cm.addLog(fmt.Sprintf("New client pending: %s (%s)", name, ip))
+	cm.addLog(fmt.Sprintf("New client connected: %s (%s)", name, ip))
 }
 
 // ApproveClient approves a pending client
@@ -437,28 +817,25 @@ func (cm *ClientManager) GetApprovedClients() []*Client {
 	return clients
 }
 
-// RemoveClient removes a client only if not approved (preserves approved clients across reconnects)
+// RemoveClient handles client disconnect (preserves approved clients)
 func (cm *ClientManager) RemoveClient(ip string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	
 	if client, ok := cm.clients[ip]; ok {
-		// Don't remove approved clients (they might be reconnecting after Nebula restart)
-		if client.Status == "approved" {
-			cm.addLog(fmt.Sprintf("Approved client disconnected (keeping for reconnect): %s (%s)", client.Name, ip))
-			if client.Conn != nil {
-				client.Conn.Close() // Close old connection
-				client.Conn = nil   // Mark as disconnected
-			}
-			return
-		}
-		
-		// Remove pending clients on disconnect
-		cm.addLog(fmt.Sprintf("Pending client disconnected: %s (%s)", client.Name, ip))
 		if client.Conn != nil {
 			client.Conn.Close()
+			client.Conn = nil
 		}
-		delete(cm.clients, ip)
+		
+		// Only fully remove pending clients
+		// Keep approved clients in list for auto-reconnect
+		if client.Status == "pending" {
+			delete(cm.clients, ip)
+			cm.addLog(fmt.Sprintf("Pending client disconnected and removed: %s (%s)", client.Name, ip))
+		} else {
+			cm.addLog(fmt.Sprintf("Approved client disconnected (kept for reconnect): %s (%s)", client.Name, ip))
+		}
 	}
 }
 
@@ -466,72 +843,46 @@ func (cm *ClientManager) RemoveClient(ip string) {
 // BINARY EXTRACTION
 // ============================================================================
 
-// Extract embedded binaries to fixed directory (avoids Windows Firewall prompts)
 func extractBinaries() error {
-	// Use fixed directory in LocalAppData (avoids firewall prompts on every run)
 	localAppData := os.Getenv("LOCALAPPDATA")
 	if localAppData == "" {
-		// Fallback to APPDATA if LOCALAPPDATA not set
 		localAppData = os.Getenv("APPDATA")
 	}
 	if localAppData == "" {
 		return fmt.Errorf("failed to determine AppData directory")
 	}
 	
-	baseDir = filepath.Join(localAppData, "NebulaVPN")
-	tempDir = baseDir // For compatibility
+	baseDir = filepath.Join(localAppData, "WoheesVPN")
+	tempDir = baseDir
 	
-	// Create main directory
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		return fmt.Errorf("failed to create app directory: %w", err)
 	}
 
-	// Note: configDir will be set based on mode (host/client) to avoid conflicts
-
-	// Create wintun directory structure that Nebula expects
-	// Nebula looks for: dist/windows/wintun/bin/amd64/wintun.dll
 	wintunDir := filepath.Join(baseDir, "dist", "windows", "wintun", "bin", "amd64")
 	if err := os.MkdirAll(wintunDir, 0755); err != nil {
 		return fmt.Errorf("failed to create wintun directory: %w", err)
 	}
 
-	// Extract wintun.dll to the expected location
 	wintunPath = filepath.Join(wintunDir, "wintun.dll")
-	if err := writeFile(wintunPath, wintunDLL); err != nil {
+	if err := os.WriteFile(wintunPath, wintunDLL, 0755); err != nil {
 		return fmt.Errorf("failed to extract wintun.dll: %w", err)
 	}
 
-	// Extract nebula.exe
 	nebulaPath = filepath.Join(baseDir, "nebula.exe")
-	if err := writeFile(nebulaPath, nebulaBinary); err != nil {
+	if err := os.WriteFile(nebulaPath, nebulaBinary, 0755); err != nil {
 		return fmt.Errorf("failed to extract nebula.exe: %w", err)
 	}
 
-	// Extract nebula-cert.exe
 	nebulaCertPath = filepath.Join(baseDir, "nebula-cert.exe")
-	if err := writeFile(nebulaCertPath, nebulaCertBinary); err != nil {
+	if err := os.WriteFile(nebulaCertPath, nebulaCertBinary, 0755); err != nil {
 		return fmt.Errorf("failed to extract nebula-cert.exe: %w", err)
 	}
 
 	return nil
 }
 
-// Write embedded binary data to file
-func writeFile(path string, data []byte) error {
-	return os.WriteFile(path, data, 0755)
-}
 
-// Cleanup function (kept for future use, but not deleting persistent directory)
-func cleanupTempDir() {
-	// Note: We no longer delete baseDir on exit to:
-	// 1. Avoid Windows Firewall prompts (same exe path every run)
-	// 2. Persist binaries (no re-extraction on every start)
-	// Config directories are mode-specific (host/client) to allow testing both simultaneously
-	// Directory: %LOCALAPPDATA%\NebulaVPN\
-}
-
-// Set config directory based on mode (host or client)
-// This allows running host and client on the same machine for testing
 func setConfigDir(mode string) error {
 	if baseDir == "" {
 		return fmt.Errorf("base directory not initialized")
@@ -539,7 +890,6 @@ func setConfigDir(mode string) error {
 	
 	configDir = filepath.Join(baseDir, mode, "config")
 	
-	// Create config directory
 	if err := os.MkdirAll(configDir, 0755); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
@@ -551,29 +901,24 @@ func setConfigDir(mode string) error {
 // NEBULA CERTIFICATE MANAGEMENT
 // ============================================================================
 
-// Generate CA certificate for host (fresh CA for each session)
 func generateCA(addLog func(string)) error {
 	caName := "nebula-mesh-ca"
 	caCertPath := filepath.Join(configDir, "ca.crt")
 	caKeyPath := filepath.Join(configDir, "ca.key")
 	
-	// Clean up old CA if it exists (fresh CA for each session)
 	os.Remove(caCertPath)
 	os.Remove(caKeyPath)
 	
 	addLog("Generating new CA certificate for this session...")
 	
-	// Run: nebula-cert ca -name "nebula-mesh-ca" -duration 24h
 	cmd := exec.Command(nebulaCertPath, "ca", 
 		"-name", caName, 
-		"-duration", "24h", // Expire in 24 hours
+		"-duration", "24h",
 		"-out-crt", caCertPath, 
 		"-out-key", caKeyPath)
 	cmd.Dir = configDir
-	
-	// Hide console window on Windows
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+		CreationFlags: 0x08000000,
 	}
 	
 	output, err := cmd.CombinedOutput()
@@ -586,12 +931,10 @@ func generateCA(addLog func(string)) error {
 	return nil
 }
 
-// Generate host certificate (fresh for each session)
 func generateHostCert(deviceName string, addLog func(string)) error {
 	hostCertPath := filepath.Join(configDir, "host.crt")
 	hostKeyPath := filepath.Join(configDir, "host.key")
 	
-	// Clean up old host cert (fresh cert for each session)
 	os.Remove(hostCertPath)
 	os.Remove(hostKeyPath)
 	
@@ -600,22 +943,18 @@ func generateHostCert(deviceName string, addLog func(string)) error {
 	caCertPath := filepath.Join(configDir, "ca.crt")
 	caKeyPath := filepath.Join(configDir, "ca.key")
 	
-	// Run: nebula-cert sign -name "deviceName" -ip "100.200.0.1/24" -duration 12h
-	// Note: Signed cert must expire BEFORE the CA (CA is 24h, so we use 12h for safety margin)
 	cmd := exec.Command(nebulaCertPath, "sign",
-		"-name", deviceName,
+		"-name", sanitizeDeviceName(deviceName),
 		"-ip", "100.200.0.1/24",
-		"-duration", "12h", // Half of CA duration for safety margin
+		"-duration", "12h",
 		"-ca-crt", caCertPath,
 		"-ca-key", caKeyPath,
 		"-out-crt", hostCertPath,
 		"-out-key", hostKeyPath,
 	)
 	cmd.Dir = configDir
-	
-	// Hide console window on Windows
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+		CreationFlags: 0x08000000,
 	}
 	
 	output, err := cmd.CombinedOutput()
@@ -632,11 +971,6 @@ func generateHostCert(deviceName string, addLog func(string)) error {
 // NEBULA CONFIGURATION
 // ============================================================================
 
-// Create Nebula config file for host
-func createHostConfig(addLog func(string)) error {
-	return createHostConfigWithServices(nil, nil, addLog)
-}
-
 // Create Nebula config file for host with service firewall rules
 func createHostConfigWithServices(services []Service, clientManager *ClientManager, addLog func(string)) error {
 	addLog("Creating Nebula configuration...")
@@ -646,7 +980,6 @@ func createHostConfigWithServices(services []Service, clientManager *ClientManag
 	hostCertPath := filepath.Join(configDir, "host.crt")
 	hostKeyPath := filepath.Join(configDir, "host.key")
 	
-	// Base config
 	config := fmt.Sprintf(`pki:
   ca: %s
   cert: %s
@@ -711,7 +1044,6 @@ firewall:
 		}
 	}
 	
-	// Close config
 	config += `
 
 logging:
@@ -727,24 +1059,19 @@ logging:
 	return nil
 }
 
-// Generate client certificate (assigns random IP for each session)
-func generateClientCert(deviceName string, invite *InviteCode, addLog func(string)) (string, error) {
+func generateClientCert(deviceName string, invite *InviteResponse, addLog func(string)) (string, error) {
 	clientCertPath := filepath.Join(configDir, "client.crt")
 	clientKeyPath := filepath.Join(configDir, "client.key")
 	
-	// Clean up old client cert (fresh cert for each join)
 	os.Remove(clientCertPath)
 	os.Remove(clientKeyPath)
 	
-	// Assign a random client IP (100.200.0.2-254)
-	rand.Seed(time.Now().UnixNano())
-	clientIPNum := rand.Intn(253) + 2 // 2-254
+	clientIPNum := rand.Intn(253) + 2
 	clientIP := fmt.Sprintf("100.200.0.%d", clientIPNum)
 	clientIPWithMask := fmt.Sprintf("%s/24", clientIP)
 	
 	addLog(fmt.Sprintf("Generating client certificate for %s...", deviceName))
 	
-	// Decode CA cert and key from invite
 	caCertData, err := base64.StdEncoding.DecodeString(invite.CACert)
 	if err != nil {
 		return "", fmt.Errorf("failed to decode CA cert: %w", err)
@@ -755,7 +1082,6 @@ func generateClientCert(deviceName string, invite *InviteCode, addLog func(strin
 		return "", fmt.Errorf("failed to decode CA key: %w", err)
 	}
 	
-	// Write CA cert and key to config dir
 	caCertPath := filepath.Join(configDir, "ca.crt")
 	caKeyPath := filepath.Join(configDir, "ca.key")
 	
@@ -769,22 +1095,18 @@ func generateClientCert(deviceName string, invite *InviteCode, addLog func(strin
 	
 	addLog(fmt.Sprintf("Assigned IP: %s", clientIP))
 	
-	// Generate client certificate using nebula-cert (12h expiration)
-	// Note: Signed cert must expire BEFORE the CA (CA is 24h, so we use 12h for safety margin)
 	cmd := exec.Command(nebulaCertPath, "sign",
-		"-name", deviceName,
+		"-name", sanitizeDeviceName(deviceName),
 		"-ip", clientIPWithMask,
-		"-duration", "12h", // Half of CA duration for safety margin
+		"-duration", "12h",
 		"-ca-crt", caCertPath,
 		"-ca-key", caKeyPath,
 		"-out-crt", clientCertPath,
 		"-out-key", clientKeyPath,
 	)
 	cmd.Dir = configDir
-	
-	// Hide console window
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+		CreationFlags: 0x08000000,
 	}
 	
 	output, err := cmd.CombinedOutput()
@@ -797,8 +1119,7 @@ func generateClientCert(deviceName string, invite *InviteCode, addLog func(strin
 	return clientIPWithMask, nil
 }
 
-// Create Nebula config file for client
-func createClientConfig(clientIP, deviceName string, invite *InviteCode, addLog func(string)) error {
+func createClientConfig(_ string, _ string, invite *InviteResponse, addLog func(string)) error {
 	addLog("Creating client configuration...")
 	
 	configPath := filepath.Join(configDir, "config.yml")
@@ -812,13 +1133,13 @@ func createClientConfig(clientIP, deviceName string, invite *InviteCode, addLog 
   key: %s
 
 static_host_map:
-  "100.200.0.1": ["%s"]
+  "%s": ["%s"]
 
 lighthouse:
   am_lighthouse: false
   interval: 60
   hosts:
-    - "100.200.0.1"
+    - "%s"
 
 listen:
   host: 0.0.0.0
@@ -845,12 +1166,12 @@ firewall:
     default_timeout: 10m
 
   outbound:
-    # Unapproved clients: Only control server access
+    # Control server access (always allowed)
     - port: 9999
       proto: tcp
       host: "100.200.0.1"
     
-    # TODO: Approved clients will get additional rules here
+    # Note: Approved clients get dynamic firewall rules via host config updates
 
   inbound:
     # Host can always reach client
@@ -861,7 +1182,7 @@ firewall:
 logging:
   level: info
   format: text
-`, caCertPath, clientCertPath, clientKeyPath, invite.HostIP)
+`, caCertPath, clientCertPath, clientKeyPath, invite.HostIP, invite.RelayIP, invite.HostIP)
 	
 	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
@@ -875,7 +1196,6 @@ logging:
 // NEBULA PROCESS MANAGEMENT
 // ============================================================================
 
-// Start Nebula as host
 func startNebulaHost(state *AppState, addLog func(string)) error {
 	addLog("Starting Nebula...")
 	
@@ -883,14 +1203,10 @@ func startNebulaHost(state *AppState, addLog func(string)) error {
 	
 	cmd := exec.Command(nebulaPath, "-config", configPath)
 	cmd.Dir = tempDir
-	
-	// Hide console window on Windows
-	// Combine CREATE_NO_WINDOW and DETACHED_PROCESS for maximum hiding
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: 0x08000000 | 0x00000008, // CREATE_NO_WINDOW | DETACHED_PROCESS
+		CreationFlags: 0x08000000 | 0x00000008,
 	}
 	
-	// Capture stdout/stderr for logging
 	cmd.Stdout = &nebulaLogger{addLog: addLog, prefix: "[nebula]"}
 	cmd.Stderr = &nebulaLogger{addLog: addLog, prefix: "[nebula]"}
 	
@@ -903,7 +1219,6 @@ func startNebulaHost(state *AppState, addLog func(string)) error {
 	addLog(fmt.Sprintf("Nebula started (PID: %d)", cmd.Process.Pid))
 	addLog("Host is now running on 100.200.0.1")
 	
-	// Monitor process in background
 	go func() {
 		cmd.Wait()
 		addLog("Nebula process exited")
@@ -914,7 +1229,6 @@ func startNebulaHost(state *AppState, addLog func(string)) error {
 	return nil
 }
 
-// Stop Nebula process
 func stopNebula(state *AppState, addLog func(string)) {
 	if state.nebulaProc != nil {
 		addLog("Stopping Nebula...")
@@ -925,28 +1239,23 @@ func stopNebula(state *AppState, addLog func(string)) {
 	}
 }
 
-// Restart Nebula (used when updating firewall rules)
 func restartNebula(state *AppState, addLog func(string)) error {
 	addLog("Restarting Nebula to apply new firewall rules...")
 	
-	// Stop current instance
 	if state.nebulaProc != nil {
 		state.nebulaProc.Kill()
 		state.nebulaProc = nil
-		time.Sleep(1 * time.Second) // Wait for clean shutdown
+		time.Sleep(1 * time.Second)
 	}
 	
-	// Regenerate config with updated firewall rules
 	if err := createHostConfigWithServices(state.services, state.clientManager, addLog); err != nil {
 		return fmt.Errorf("failed to regenerate config: %w", err)
 	}
 	
-	// Restart Nebula
 	if err := startNebulaHost(state, addLog); err != nil {
 		return fmt.Errorf("failed to restart Nebula: %w", err)
 	}
 	
-	// Restart control server
 	if state.controlServer != nil {
 		state.controlServer.Close()
 		time.Sleep(500 * time.Millisecond)
@@ -961,10 +1270,9 @@ func restartNebula(state *AppState, addLog func(string)) error {
 }
 
 // ============================================================================
-// CONTROL PROTOCOL (CLIENT TRACKING)
+// CONTROL PROTOCOL
 // ============================================================================
 
-// Start control server on host (port 9999 on Nebula network)
 func startControlServer(state *AppState, addLog func(string)) error {
 	addLog("Starting control server on 100.200.0.1:9999...")
 	
@@ -975,21 +1283,17 @@ func startControlServer(state *AppState, addLog func(string)) error {
 	
 	state.controlServer = listener
 	
-	// Only create ClientManager if it doesn't exist (preserve approval states on restart)
 	if state.clientManager == nil {
 		state.clientManager = NewClientManager(addLog)
 	}
 	
-	// Accept connections in background
 	go func() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				// Server closed
 				return
 			}
 			
-			// Handle client in background
 			go handleControlClient(conn, state, addLog)
 		}
 	}()
@@ -998,53 +1302,51 @@ func startControlServer(state *AppState, addLog func(string)) error {
 	return nil
 }
 
-// Handle a control client connection
 func handleControlClient(conn net.Conn, state *AppState, addLog func(string)) {
 	defer conn.Close()
 	
 	decoder := json.NewDecoder(conn)
 	var msg ControlMessage
 	
-	// Read registration message
 	if err := decoder.Decode(&msg); err != nil {
 		return
 	}
 	
 	if msg.Type == "register" {
-		clientIP := msg.IP // Save IP for cleanup
+		clientIP := msg.IP
 		
-		// Add client (or update if reconnecting)
-		state.clientManager.AddClient(msg.Name, clientIP, conn)
+	state.clientManager.mu.Lock()
+	_, ipTaken := state.clientManager.clients[clientIP]
+	if ipTaken {
+		state.clientManager.mu.Unlock()
+		conflictMsg := ControlMessage{Type: "ip_conflict"}
+		json.NewEncoder(conn).Encode(conflictMsg)
+		addLog(fmt.Sprintf("IP conflict rejected: %s (IP: %s)", msg.Name, clientIP))
+		return
+	}
+	state.clientManager.AddClient(msg.Name, clientIP, conn)
+	state.clientManager.mu.Unlock()
 		
-		// If client is already approved (reconnecting after restart), send approve message
-		state.clientManager.mu.RLock()
-		client, exists := state.clientManager.clients[clientIP]
-		isApproved := exists && client.Status == "approved"
-		state.clientManager.mu.RUnlock()
+	state.clientManager.mu.RLock()
+	client, exists := state.clientManager.clients[clientIP]
+	isApproved := exists && client.Status == "approved"
+	state.clientManager.mu.RUnlock()
 		
 		if isApproved {
-			// Send approval message immediately for reconnected approved clients
 			approveMsg := ControlMessage{Type: "approve"}
 			json.NewEncoder(conn).Encode(approveMsg)
 		}
 		
-		// Keep connection open for future messages
 		for {
 			if err := decoder.Decode(&msg); err != nil {
-				// Client disconnected
 				state.clientManager.RemoveClient(clientIP)
 				return
 			}
 			
-			// Handle heartbeat or other messages
-			if msg.Type == "heartbeat" {
-				// Client is still alive
-			}
 		}
 	}
 }
 
-// Stop control server
 func stopControlServer(state *AppState, addLog func(string)) {
 	if state.controlServer != nil {
 		addLog("Stopping control server...")
@@ -1054,33 +1356,27 @@ func stopControlServer(state *AppState, addLog func(string)) {
 	}
 }
 
-// Connect to control server (client) with auto-reconnect
 func connectToControlServer(state *AppState, hostIP string, addLog func(string), updateContent func()) error {
 	addLog(fmt.Sprintf("Connecting to control server at %s:9999...", hostIP))
 	
-	// Initial connection
 	if err := attemptControlConnection(state, hostIP, addLog, updateContent); err != nil {
 		return err
 	}
 	
-	// Auto-reconnect goroutine
 	go func() {
 		for {
 			time.Sleep(5 * time.Second)
 			
-			// Check if still in join mode and not kicked
 			if state.mode != "join" || state.kickedByHost || !state.isConnected {
-				return // Stop auto-reconnect
+				return
 			}
 			
-			// Check if connection is alive
 			if state.controlClient == nil {
 				addLog("Control server disconnected, attempting to reconnect...")
 				
-				// Try to reconnect
 				for i := 0; i < 3; i++ {
 					if err := attemptControlConnection(state, hostIP, addLog, updateContent); err == nil {
-						addLog("✅ Reconnected to control server")
+						addLog("Reconnected to control server")
 						break
 					}
 					time.Sleep(2 * time.Second)
@@ -1092,9 +1388,7 @@ func connectToControlServer(state *AppState, hostIP string, addLog func(string),
 	return nil
 }
 
-// Attempt a single connection to control server
 func attemptControlConnection(state *AppState, hostIP string, addLog func(string), updateContent func()) error {
-	// Try to connect with timeout
 	conn, err := net.DialTimeout("tcp", hostIP+":9999", 10*time.Second)
 	if err != nil {
 		return fmt.Errorf("failed to connect to host control server: %w", err)
@@ -1102,11 +1396,10 @@ func attemptControlConnection(state *AppState, hostIP string, addLog func(string
 	
 	state.controlClient = conn
 	
-	// Send registration
 	msg := ControlMessage{
 		Type: "register",
 		Name: state.deviceName,
-		IP:   strings.Split(state.clientIP, "/")[0], // Remove /24 mask
+		IP:   strings.Split(state.clientIP, "/")[0],
 	}
 	
 	if err := json.NewEncoder(conn).Encode(msg); err != nil {
@@ -1115,21 +1408,17 @@ func attemptControlConnection(state *AppState, hostIP string, addLog func(string
 		return fmt.Errorf("failed to register with host: %w", err)
 	}
 	
-	// Only log registration on first connect or explicit reconnect
 	if !state.isApproved {
 		addLog("Registered with host, awaiting approval...")
 	}
 	
-	// Listen for messages from host in background
 	go func() {
 		decoder := json.NewDecoder(conn)
 		for {
 			var msg ControlMessage
 			if err := decoder.Decode(&msg); err != nil {
-				// Connection lost
 				state.controlClient = nil
 				
-				// Only show error if we were kicked (intentional disconnect)
 				if state.kickedByHost {
 					addLog("Connection to host closed")
 				}
@@ -1138,11 +1427,14 @@ func attemptControlConnection(state *AppState, hostIP string, addLog func(string
 			}
 			
 			switch msg.Type {
+			case "ip_conflict":
+				addLog("IP conflict detected, connection rejected by host")
+				state.controlClient = nil
+				return
 			case "approve":
 				if !state.isApproved {
 					state.isApproved = true
-					addLog("✅ Host approved your connection!")
-					// Update UI to show approved status
+					addLog("Host approved your connection")
 					fyne.Do(func() {
 						updateContent()
 					})
@@ -1163,26 +1455,7 @@ func attemptControlConnection(state *AppState, hostIP string, addLog func(string
 	return nil
 }
 
-// Disconnect from control server (client)
-func disconnectFromControlServer(state *AppState) {
-	if state.controlClient != nil {
-		state.controlClient.Close()
-		state.controlClient = nil
-	}
-}
 
-// Validate host is reachable before joining
-func validateHostConnection(hostIP string) error {
-	// Try to dial the Nebula lighthouse port with timeout
-	conn, err := net.DialTimeout("tcp", hostIP, 2*time.Second)
-	if err != nil {
-		return fmt.Errorf("host not reachable: %w", err)
-	}
-	conn.Close()
-	return nil
-}
-
-// Custom writer for Nebula logs
 type nebulaLogger struct {
 	addLog func(string)
 	prefix string
@@ -1192,7 +1465,6 @@ type nebulaLogger struct {
 func (nl *nebulaLogger) Write(p []byte) (n int, err error) {
 	nl.buffer += string(p)
 	
-	// Process complete lines
 	for {
 		idx := strings.Index(nl.buffer, "\n")
 		if idx == -1 {
@@ -1201,6 +1473,10 @@ func (nl *nebulaLogger) Write(p []byte) (n int, err error) {
 		
 		line := strings.TrimSpace(nl.buffer[:idx])
 		if line != "" {
+			if strings.Contains(line, "Handshake timed out") {
+				nl.buffer = nl.buffer[idx+1:]
+				continue
+			}
 			nl.addLog(nl.prefix + " " + line)
 		}
 		nl.buffer = nl.buffer[idx+1:]
@@ -1241,7 +1517,7 @@ func buildModeSelection(state *AppState, updateContent func(), setStatus func(st
 			}
 			
 			// Create config file
-			if err := createHostConfig(addLog); err != nil {
+			if err := createHostConfigWithServices(nil, nil, addLog); err != nil {
 				setStatus("Failed to create config: " + err.Error())
 				return
 			}
@@ -1260,16 +1536,61 @@ func buildModeSelection(state *AppState, updateContent func(), setStatus func(st
 				addLog("Warning: Failed to start control server: " + err.Error())
 			}
 			
-			// Generate invite code
-			code, err := generateInviteCode()
+			// Register with relay server and get invite code
+			code, err := registerWithRelay(state, addLog)
 			if err != nil {
-				addLog("Warning: Failed to generate invite code: " + err.Error())
-			} else {
-				state.inviteCode = code
-				addLog("Invite code generated")
+				setStatus("Failed to register with relay: " + err.Error())
+				addLog("ERROR: " + err.Error())
+				return
 			}
+			state.inviteCode = code
 			
 			setStatus("Hosting active on 100.200.0.1")
+			
+			// Update UI to show invite code
+			fyne.Do(func() {
+				updateContent()
+			})
+			
+			// Start auto-regeneration (every 10 minutes)
+			state.stopAutoRegen = make(chan bool)
+			go func() {
+				ticker := time.NewTicker(10 * time.Minute)
+				defer ticker.Stop()
+				
+				for {
+					select {
+					case <-ticker.C:
+						if state.mode != "host" || !state.isConnected {
+							return
+						}
+						
+						addLog("Auto-regenerating invite code...")
+						
+						// Unregister old code
+						if state.inviteCode != "" {
+							unregisterFromRelay(state, state.inviteCode, addLog)
+						}
+						
+						// Register new code
+						newCode, err := registerWithRelay(state, addLog)
+						if err != nil {
+							addLog("Auto-regen failed: " + err.Error())
+							continue
+						}
+						
+						state.inviteCode = newCode
+						addLog("Invite code auto-regenerated")
+						
+						// Update UI
+						fyne.Do(func() {
+							updateContent()
+						})
+					case <-state.stopAutoRegen:
+						return
+					}
+				}
+			}()
 		}()
 	})
 	hostBtn.Importance = widget.HighImportance
@@ -1289,10 +1610,9 @@ func buildModeSelection(state *AppState, updateContent func(), setStatus func(st
 }
 
 func buildHostView(state *AppState, updateContent func(), setStatus func(string), addLog func(string), window fyne.Window, app fyne.App) fyne.CanvasObject {
-	// Invite code display (read-only)
-	inviteCodeEntry := widget.NewEntry()
-	inviteCodeEntry.SetText(state.inviteCode)
-	inviteCodeEntry.Disable()
+	// Invite code display as label for better visibility
+	inviteCodeLabel := widget.NewLabel(state.inviteCode)
+	inviteCodeLabel.TextStyle = fyne.TextStyle{Monospace: true}
 
 	// Copy invite code to clipboard
 	copyBtn := widget.NewButtonWithIcon("", theme.ContentCopyIcon(), func() {
@@ -1300,25 +1620,48 @@ func buildHostView(state *AppState, updateContent func(), setStatus func(string)
 		setStatus("Invite code copied to clipboard")
 	})
 
-	// Regenerate invite code
+	// Regenerate invite code (re-register with relay)
 	refreshBtn := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), func() {
-		code, err := generateInviteCode()
-		if err != nil {
-			setStatus("Failed to generate invite code: " + err.Error())
-			return
-		}
-		state.inviteCode = code
-		inviteCodeEntry.SetText(state.inviteCode)
-		setStatus("New invite code generated")
+		go func() {
+			// Unregister old code
+			if state.inviteCode != "" {
+				unregisterFromRelay(state, state.inviteCode, addLog)
+			}
+			
+			// Register new code
+			code, err := registerWithRelay(state, addLog)
+			if err != nil {
+				setStatus("Failed to register with relay: " + err.Error())
+				return
+			}
+			
+			fyne.Do(func() {
+				state.inviteCode = code
+				inviteCodeLabel.SetText(state.inviteCode)
+				setStatus("New invite code generated")
+			})
+		}()
 	})
 
 	inviteBox := container.NewBorder(nil, nil, nil,
 		container.NewHBox(copyBtn, refreshBtn),
-		inviteCodeEntry,
+		inviteCodeLabel,
 	)
 
 	// Stop hosting button
 	stopHostingBtn := widget.NewButton("Stop Hosting", func() {
+		// Stop auto-regeneration
+		if state.stopAutoRegen != nil {
+			close(state.stopAutoRegen)
+			state.stopAutoRegen = nil
+		}
+		
+		// Unregister from relay
+		if state.inviteCode != "" {
+			go unregisterFromRelay(state, state.inviteCode, addLog)
+			state.inviteCode = ""
+		}
+		
 		// Stop control server
 		stopControlServer(state, addLog)
 		
@@ -1371,33 +1714,77 @@ func buildHostView(state *AppState, updateContent func(), setStatus func(string)
 				}
 			}()
 
-			// Handle window close
-			state.clientsWindow.SetOnClosed(func() {
-				state.showClients = false
-				state.clientsWindow = nil
-				clientsToggleBtn.SetIcon(theme.NavigateNextIcon())
-				setStatus("Clients window closed")
-			})
-
-			clientsToggleBtn.SetIcon(theme.NavigateBackIcon())
-			state.clientsWindow.Show()
-			setStatus("Clients window opened")
-		} else {
-			// Close clients window
-			state.clientsWindow.Close()
-			state.clientsWindow = nil
+		// Handle window close
+		state.clientsWindow.SetOnClosed(func() {
 			state.showClients = false
+			state.clientsWindow = nil
 			clientsToggleBtn.SetIcon(theme.NavigateNextIcon())
-			setStatus("Clients window closed")
-		}
+		})
+
+		clientsToggleBtn.SetIcon(theme.NavigateBackIcon())
+		state.clientsWindow.Show()
+	} else {
+		// Close clients window
+		state.clientsWindow.Close()
+		state.clientsWindow = nil
+		state.showClients = false
+		clientsToggleBtn.SetIcon(theme.NavigateNextIcon())
+	}
 	})
 	clientsToggleBtn.Importance = widget.LowImportance
+
+	// Create clients label with dynamic count and pending indicator
+	clientsLabel := widget.NewLabel("Clients")
+	
+	// Update clients label with count and pending indicator
+	updateClientsLabel := func() {
+		clientsLabelText := "Clients"
+		if state.clientManager != nil {
+			clients := state.clientManager.GetClients()
+			// Only count clients with active connections
+			connectedCount := 0
+			pendingCount := 0
+			for _, client := range clients {
+				if client.Conn != nil {
+					connectedCount++
+					if client.Status == "pending" {
+						pendingCount++
+					}
+				}
+			}
+			if connectedCount > 0 {
+				if pendingCount > 0 {
+					clientsLabelText = fmt.Sprintf("Clients (%d) !", connectedCount)
+				} else {
+					clientsLabelText = fmt.Sprintf("Clients (%d)", connectedCount)
+				}
+			}
+		}
+		clientsLabel.SetText(clientsLabelText)
+	}
+	updateClientsLabel()
+	
+	// Auto-update clients label every 2 seconds
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if state.mode != "host" || !state.isConnected {
+				return
+			}
+			fyne.Do(func() {
+				updateClientsLabel()
+			})
+		}
+	}()
+
+	clientsRow := container.NewBorder(nil, nil, clientsLabel, clientsToggleBtn, nil)
 
 	return container.NewVBox(
 		widget.NewLabel("Invite Code"),
 		inviteBox,
 		stopHostingBtn,
-		container.NewBorder(nil, nil, widget.NewLabel("Connected Clients"), clientsToggleBtn, nil),
+		clientsRow,
 	)
 }
 
@@ -1430,46 +1817,95 @@ func buildJoinView(state *AppState, updateContent func(), setStatus func(string)
 				return
 			}
 			
-			// Parse invite code
-			invite, err := parseInviteCode(inviteCodeEntry.Text)
+			// Validate relay server configured
+			if state.relayServer == "" {
+				setStatus("Relay server not configured - set in Settings")
+				return
+			}
+			
+			// Fetch network info from relay using invite code
+			inviteCode := strings.TrimSpace(strings.ToUpper(inviteCodeEntry.Text))
+			if len(inviteCode) != InviteCodeLength {
+				setStatus(fmt.Sprintf("Invalid invite code (must be %d characters)", InviteCodeLength))
+				return
+			}
+			
+			invite, err := fetchFromRelay(inviteCode, state.relayServer, state.relayPort, addLog)
 			if err != nil {
-				setStatus("Invalid invite code: " + err.Error())
+				setStatus("Failed to fetch network info: " + err.Error())
 				return
 			}
 			
-			addLog("Invite code accepted")
-			addLog(fmt.Sprintf("Connecting to host at %s", invite.HostIP))
+			addLog(fmt.Sprintf("Connecting to host at %s", invite.RelayIP))
 			
-			// Generate client certificate
-			clientIP, err := generateClientCert(state.deviceName, invite, addLog)
-			if err != nil {
-				setStatus("Failed to generate certificate: " + err.Error())
-				return
+			// Retry loop for IP collision handling
+			maxRetries := 10
+			var clientIP string
+			connected := false
+			
+			for attempt := 0; attempt < maxRetries; attempt++ {
+				if attempt > 0 {
+					addLog(fmt.Sprintf("Retrying with new IP (%d/%d)...", attempt+1, maxRetries))
+				}
+				
+				// Generate client certificate with random IP
+				var err error
+				clientIP, err = generateClientCert(state.deviceName, invite, addLog)
+				if err != nil {
+					setStatus("Failed to generate certificate: " + err.Error())
+					return
+				}
+				
+				state.clientIP = clientIP
+				
+				// Create client config
+				if err := createClientConfig(clientIP, state.deviceName, invite, addLog); err != nil {
+					setStatus("Failed to create config: " + err.Error())
+					return
+				}
+				
+				// Start Nebula as client
+				if err := startNebulaHost(state, addLog); err != nil {
+					setStatus("Failed to start Nebula: " + err.Error())
+					return
+				}
+				
+				setStatus(fmt.Sprintf("Connected! IP: %s", clientIP))
+				
+				// Wait for Nebula interface and handshake to complete
+				addLog("Waiting for Nebula handshake...")
+				time.Sleep(5 * time.Second)
+				
+				// Connect to host control server via Nebula overlay
+				err = connectToControlServer(state, "100.200.0.1", addLog, updateContent)
+				if err != nil {
+					addLog("Failed to connect to control server: " + err.Error())
+					stopNebula(state, addLog)
+					
+					if attempt < maxRetries-1 {
+						time.Sleep(1 * time.Second)
+						continue
+					}
+					setStatus("Failed to connect after retries")
+					return
+				}
+				
+				// Check if connection was rejected due to IP conflict
+				time.Sleep(500 * time.Millisecond)
+				if state.controlClient == nil {
+					addLog("IP conflict detected, trying new IP...")
+					stopNebula(state, addLog)
+					time.Sleep(1 * time.Second)
+					continue
+				}
+				
+				connected = true
+				break
 			}
 			
-			state.clientIP = clientIP
-			
-			// Create client config
-			if err := createClientConfig(clientIP, state.deviceName, invite, addLog); err != nil {
-				setStatus("Failed to create config: " + err.Error())
+			if !connected {
+				setStatus("Failed to find available IP after retries")
 				return
-			}
-			
-			// Start Nebula as client
-			if err := startNebulaHost(state, addLog); err != nil { // Reusing same start function
-				setStatus("Failed to start Nebula: " + err.Error())
-				return
-			}
-			
-			setStatus(fmt.Sprintf("Connected! IP: %s", clientIP))
-			
-			// Wait for Nebula interface and handshake to complete
-			addLog("Waiting for Nebula handshake...")
-			time.Sleep(5 * time.Second)
-			
-			// Connect to host control server via Nebula overlay (always 100.200.0.1)
-			if err := connectToControlServer(state, "100.200.0.1", addLog, updateContent); err != nil {
-				addLog("Warning: Failed to connect to control server: " + err.Error())
 			}
 			
 			// Update UI to enable disconnect button
@@ -1501,8 +1937,11 @@ func buildJoinView(state *AppState, updateContent func(), setStatus func(string)
 		if state.isApproved {
 			// Approved: Show "Disconnect" button
 			backDisconnectBtn = widget.NewButton("Disconnect", func() {
-				// Disconnect from control server
-				disconnectFromControlServer(state)
+			// Disconnect from control server
+			if state.controlClient != nil {
+				state.controlClient.Close()
+				state.controlClient = nil
+			}
 				
 				// Stop Nebula process
 				stopNebula(state, addLog)
@@ -1517,8 +1956,11 @@ func buildJoinView(state *AppState, updateContent func(), setStatus func(string)
 		} else {
 			// Pending approval: Show status in button
 			backDisconnectBtn = widget.NewButton("Pending Approval...", func() {
-				// Can still disconnect while pending
-				disconnectFromControlServer(state)
+			// Can still disconnect while pending
+			if state.controlClient != nil {
+				state.controlClient.Close()
+				state.controlClient = nil
+			}
 				stopNebula(state, addLog)
 				
 				state.mode = ""
@@ -1563,6 +2005,7 @@ func buildDeviceNameWidget(state *AppState, updateContent func(), setStatus func
 			if len(nameEntry.Text) > 0 && len(nameEntry.Text) <= 16 {
 				state.deviceName = nameEntry.Text
 				state.editingDevice = false
+				saveSettings(state)
 				updateContent()
 			}
 		})
@@ -1589,21 +2032,21 @@ func buildDeviceNameWidget(state *AppState, updateContent func(), setStatus func
 		container.NewHBox(editBtn, settingsBtn), nameLabel)
 }
 
-// Open settings window for service/port management
+// Open settings window with tabs for services and relay config
 func openSettingsWindow(state *AppState, setStatus func(string), app fyne.App) {
 	if state.settingsWindow != nil {
 		state.settingsWindow.RequestFocus()
 		return
 	}
 
-	state.settingsWindow = app.NewWindow("Settings - Exposed Services")
+	state.settingsWindow = app.NewWindow("Settings")
 	state.settingsWindow.SetFixedSize(true)
 
-	// Services list
+	// === SERVICES TAB ===
 	servicesContainer := container.NewVBox()
 	buildServicesPanel(state, servicesContainer, setStatus)
-
-	// Add service form
+	
+	// Manual entry section
 	nameEntry := widget.NewEntry()
 	nameEntry.SetPlaceHolder("Service name (e.g., Minecraft)")
 
@@ -1613,63 +2056,300 @@ func openSettingsWindow(state *AppState, setStatus func(string), app fyne.App) {
 	protoSelect := widget.NewSelect([]string{"tcp", "udp"}, nil)
 	protoSelect.SetSelected("tcp")
 
-	addBtn := widget.NewButton("Add Service", func() {
+	addManualBtn := widget.NewButton("Add", func() {
 		if nameEntry.Text == "" || portEntry.Text == "" {
 			setStatus("Please fill in all fields")
 			return
 		}
 
-		// Parse port
 		var port int
 		if _, err := fmt.Sscanf(portEntry.Text, "%d", &port); err != nil || port < 1 || port > 65535 {
 			setStatus("Invalid port number (1-65535)")
 			return
 		}
 
-		// Add service
+		// Check for duplicates
+		if serviceExists(state.services, port, protoSelect.Selected) {
+			setStatus(fmt.Sprintf("Port %d (%s) already exists", port, protoSelect.Selected))
+			return
+		}
+
 		state.services = append(state.services, Service{
 			Name:  nameEntry.Text,
 			Port:  port,
 			Proto: protoSelect.Selected,
 		})
 
+		saveSettings(state)
 		setStatus(fmt.Sprintf("Added service: %s (port %d)", nameEntry.Text, port))
 
-		// Clear form
 		nameEntry.SetText("")
 		portEntry.SetText("")
 
-		// Refresh services list
 		servicesContainer.Objects = servicesContainer.Objects[:0]
 		buildServicesPanel(state, servicesContainer, setStatus)
 		state.settingsWindow.Content().Refresh()
 	})
-	addBtn.Importance = widget.HighImportance
-
-	addForm := container.NewVBox(
-		widget.NewLabel("Add New Service:"),
+	addManualBtn.Importance = widget.HighImportance
+	
+	manualSection := container.NewVBox(
+		widget.NewLabel("Manual Entry:"),
 		widget.NewForm(
 			widget.NewFormItem("Name", nameEntry),
 			widget.NewFormItem("Port", portEntry),
 			widget.NewFormItem("Protocol", protoSelect),
 		),
-		addBtn,
+		addManualBtn,
+	)
+	
+	// Running applications section with dropdown
+	var runningApps []RunningApp
+	var selectedAppIndex int = -1
+	
+	appOptions := []string{"Scanning..."}
+	appSelect := widget.NewSelect(appOptions, func(selected string) {
+		// Find selected app index by matching the full display string
+		for i, app := range runningApps {
+			portInfo := ""
+			if len(app.TCPPorts) > 0 {
+				portInfo += fmt.Sprintf("TCP: %v", app.TCPPorts)
+			}
+			if len(app.UDPPorts) > 0 {
+				if portInfo != "" {
+					portInfo += ", "
+				}
+				portInfo += fmt.Sprintf("UDP: %v", app.UDPPorts)
+			}
+			displayText := fmt.Sprintf("%s (%s)", app.ExeName, portInfo)
+			if selected == displayText {
+				selectedAppIndex = i
+				return
+			}
+		}
+		selectedAppIndex = -1
+	})
+	appSelect.PlaceHolder = "Select application"
+	
+	// Track if we should keep scanning
+	stopScanning := make(chan bool)
+	
+	// Auto-scan every 10 seconds (only while settings window is open)
+	go func() {
+		// Initial scan
+		time.Sleep(500 * time.Millisecond)
+		apps, _ := detectRunningApps()
+		fyne.Do(func() {
+			if state.settingsWindow == nil {
+				return
+			}
+			runningApps = apps
+			newOptions := []string{}
+			for _, app := range apps {
+				portInfo := ""
+				if len(app.TCPPorts) > 0 {
+					portInfo += fmt.Sprintf("TCP: %v", app.TCPPorts)
+				}
+				if len(app.UDPPorts) > 0 {
+					if portInfo != "" {
+						portInfo += ", "
+					}
+					portInfo += fmt.Sprintf("UDP: %v", app.UDPPorts)
+				}
+				newOptions = append(newOptions, fmt.Sprintf("%s (%s)", app.ExeName, portInfo))
+			}
+			if len(newOptions) == 0 {
+				appSelect.Options = []string{"No applications found"}
+			} else {
+				appSelect.Options = newOptions
+			}
+			appSelect.Refresh()
+		})
+		
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		
+		for {
+			select {
+			case <-ticker.C:
+				if state.settingsWindow == nil {
+					return
+				}
+				
+				apps, err := detectRunningApps()
+				if err != nil {
+					continue
+				}
+				
+				fyne.Do(func() {
+					if state.settingsWindow == nil {
+						return
+					}
+					runningApps = apps
+					newOptions := []string{}
+					for _, app := range apps {
+						portInfo := ""
+						if len(app.TCPPorts) > 0 {
+							portInfo += fmt.Sprintf("TCP: %v", app.TCPPorts)
+						}
+						if len(app.UDPPorts) > 0 {
+							if portInfo != "" {
+								portInfo += ", "
+							}
+							portInfo += fmt.Sprintf("UDP: %v", app.UDPPorts)
+						}
+						newOptions = append(newOptions, fmt.Sprintf("%s (%s)", app.ExeName, portInfo))
+					}
+					if len(newOptions) == 0 {
+						appSelect.Options = []string{"No applications found"}
+					} else {
+						appSelect.Options = newOptions
+					}
+					appSelect.Refresh()
+				})
+			case <-stopScanning:
+				return
+			}
+		}
+	}()
+	
+	addAppBtn := widget.NewButton("Add Application", func() {
+		if selectedAppIndex < 0 || selectedAppIndex >= len(runningApps) {
+			setStatus("Please select an application")
+			return
+		}
+		
+		app := runningApps[selectedAppIndex]
+		added := 0
+		
+		// Check for duplicates and add ports
+		for _, port := range app.TCPPorts {
+			if !serviceExists(state.services, port, "tcp") {
+				state.services = append(state.services, Service{
+					Name:  strings.TrimSuffix(app.ExeName, ".exe"),
+					Port:  port,
+					Proto: "tcp",
+				})
+				added++
+			}
+		}
+		for _, port := range app.UDPPorts {
+			if !serviceExists(state.services, port, "udp") {
+				state.services = append(state.services, Service{
+					Name:  strings.TrimSuffix(app.ExeName, ".exe"),
+					Port:  port,
+					Proto: "udp",
+				})
+				added++
+			}
+		}
+		
+		if added > 0 {
+			saveSettings(state)
+			setStatus(fmt.Sprintf("Added %d ports from %s", added, app.ExeName))
+			
+			servicesContainer.Objects = servicesContainer.Objects[:0]
+			buildServicesPanel(state, servicesContainer, setStatus)
+			state.settingsWindow.Content().Refresh()
+		} else {
+			setStatus("All ports already exist")
+		}
+		
+		appSelect.ClearSelected()
+		selectedAppIndex = -1
+	})
+	addAppBtn.Importance = widget.HighImportance
+	
+	appsSection := container.NewVBox(
+		widget.NewLabel("Running Applications (auto-scans):"),
+		appSelect,
+		addAppBtn,
 	)
 
-	content := container.NewBorder(
-		widget.NewLabel("Exposed Services"),
-		addForm,
+	// Make services scrollable to prevent window expansion
+	servicesScroll := container.NewVScroll(servicesContainer)
+	servicesScroll.SetMinSize(fyne.NewSize(350, 150))
+	
+	servicesTab := container.NewBorder(
+		container.NewVBox(
+			widget.NewLabel("Exposed Services"),
+			newWhiteSeparator(),
+		),
+		container.NewVBox(
+			newWhiteSeparator(),
+			appsSection,
+			newWhiteSeparator(),
+			manualSection,
+		),
 		nil,
 		nil,
-		servicesContainer,
+		servicesScroll,
 	)
 
-	state.settingsWindow.SetContent(content)
-	state.settingsWindow.Resize(fyne.NewSize(350, 400))
+	// === RELAY TAB ===
+	relayServerEntry := widget.NewEntry()
+	relayServerEntry.SetPlaceHolder("e.g. relay.example.com or 123.45.67.89")
+	if state.relayServer != "" {
+		relayServerEntry.SetText(state.relayServer)
+	}
+	relayServerEntry.OnChanged = func(text string) {
+		state.relayServer = strings.TrimSpace(text)
+		saveSettings(state)
+	}
 
-	// Handle window close
+	relayPortEntry := widget.NewEntry()
+	relayPortEntry.SetPlaceHolder(fmt.Sprintf("Default: %d", RelayHTTPPort))
+	if state.relayPort > 0 && state.relayPort != RelayHTTPPort {
+		relayPortEntry.SetText(fmt.Sprintf("%d", state.relayPort))
+	}
+	relayPortEntry.OnChanged = func(text string) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			state.relayPort = RelayHTTPPort
+			saveSettings(state)
+			return
+		}
+		var port int
+		if _, err := fmt.Sscanf(text, "%d", &port); err == nil && port > 0 && port <= 65535 {
+			state.relayPort = port
+			saveSettings(state)
+		}
+	}
+
+	relayAPIEntry := widget.NewEntry()
+	relayAPIEntry.SetPlaceHolder("Required for hosting")
+	if state.relayAPIKey != "" {
+		relayAPIEntry.SetText(state.relayAPIKey)
+	}
+	relayAPIEntry.OnChanged = func(text string) {
+		state.relayAPIKey = strings.TrimSpace(text)
+		saveSettings(state)
+	}
+
+	relayTab := container.NewVBox(
+		widget.NewLabel("Relay Configuration (Required)"),
+		widget.NewLabel("All connections require a relay server"),
+		widget.NewLabel("✅ Using HTTPS with self-signed certificates"),
+		newWhiteSeparator(),
+		widget.NewForm(
+			widget.NewFormItem("Server Address", relayServerEntry),
+			widget.NewFormItem("HTTPS Port", relayPortEntry),
+			widget.NewFormItem("API Key*", relayAPIEntry),
+		),
+		widget.NewLabel("* Required for hosting"),
+	)
+
+	// Create tabs
+	tabs := container.NewAppTabs(
+		container.NewTabItem("Services", servicesTab),
+		container.NewTabItem("Relay", relayTab),
+	)
+
+	state.settingsWindow.SetContent(tabs)
+	state.settingsWindow.Resize(fyne.NewSize(400, 450))
+
 	state.settingsWindow.SetOnClosed(func() {
 		state.settingsWindow = nil
+		close(stopScanning)
 	})
 
 	state.settingsWindow.Show()
@@ -1691,6 +2371,7 @@ func buildServicesPanel(state *AppState, panel *fyne.Container, setStatus func(s
 		deleteBtn := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
 			// Remove service
 			state.services = append(state.services[:serviceIdx], state.services[serviceIdx+1:]...)
+			saveSettings(state)
 			setStatus(fmt.Sprintf("Removed service: %s", service.Name))
 
 			// Refresh services list
@@ -1720,14 +2401,23 @@ func buildClientsPanel(state *AppState, panel *fyne.Container, setStatus func(st
 	}
 
 	clients := state.clientManager.GetClients()
-	if len(clients) == 0 {
+	
+	// Filter to only show connected clients
+	connectedClients := []*Client{}
+	for _, client := range clients {
+		if client.Conn != nil {
+			connectedClients = append(connectedClients, client)
+		}
+	}
+	
+	if len(connectedClients) == 0 {
 		noClientsLabel := widget.NewLabel("No clients connected")
 		panel.Objects = append(panel.Objects, noClientsLabel)
 		return
 	}
 
-	// Render real client list
-	for _, client := range clients {
+	// Render connected client list
+	for _, client := range connectedClients {
 		clientIP := client.IP
 		clientName := client.Name
 		clientLabel := widget.NewLabel(fmt.Sprintf("%s (%s)", client.Name, client.IP))

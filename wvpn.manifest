@@ -3,10 +3,10 @@
   <assemblyIdentity
       version="1.0.0.0"
       processorArchitecture="*"
-      name="InviteVPN"
+      name="Wvpn"
       type="win32"
   />
-  <description>Nebula VPN Mesh Network Tool</description>
+  <description>Wohee's VPN Mesh Network Tool</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
@@ -15,4 +15,3 @@
     </security>
   </trustInfo>
 </assembly>
-

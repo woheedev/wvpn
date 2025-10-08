@@ -1,8 +1,12 @@
-module invite_vpn
+module wvpn
 
 go 1.25.1
 
-require fyne.io/fyne/v2 v2.6.3
+require (
+	fyne.io/fyne/v2 v2.6.3
+	github.com/gorilla/mux v1.8.1
+	golang.org/x/time v0.8.0
+)
 
 require (
 	fyne.io/systray v1.11.0 // indirect

@@ -6,16 +6,11 @@
 .DS_Store
 Thumbs.db
 
-# Application data (if accidentally committed)
-*.crt
-*.key
-config.yml
-state.json
-
-# Windows resource file (auto-generated)
+# Windows resource file
 rsrc.syso
 
 # Build artifacts
 *.exe
 *.exe~
 !binaries/*.exe
+wvpn_relay
